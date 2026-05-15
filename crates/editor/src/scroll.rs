@@ -29,6 +29,8 @@ use workspace::{ItemId, WorkspaceId};
 
 pub const SCROLL_EVENT_SEPARATION: Duration = Duration::from_millis(28);
 const SCROLLBAR_SHOW_INTERVAL: Duration = Duration::from_secs(1);
+const SMOOTH_SCROLL_TIME_CONSTANT_SECS: f64 = 0.025;
+const SMOOTH_SCROLL_SNAP_THRESHOLD: f64 = 0.001;
 
 pub struct WasScrolled(pub(crate) bool);
 
@@ -218,6 +220,8 @@ pub struct ScrollManager {
     visible_column_count: Option<f64>,
     forbid_vertical_scroll: bool,
     minimap_thumb_state: Option<ScrollbarThumbState>,
+    smooth_scroll_target: Option<gpui::Point<ScrollOffset>>,
+    smooth_scroll_last_step: Option<Instant>,
     _save_scroll_position_task: Task<()>,
 }
 
@@ -241,6 +245,8 @@ impl ScrollManager {
             visible_column_count: None,
             forbid_vertical_scroll: false,
             minimap_thumb_state: None,
+            smooth_scroll_target: None,
+            smooth_scroll_last_step: None,
             _save_scroll_position_task: Task::ready(()),
         }
     }
@@ -449,28 +455,33 @@ impl ScrollManager {
             shared.scroll_anchor = adjusted_anchor;
             shared.display_map_id = Some(display_map.display_map_id);
         });
-        cx.emit(EditorEvent::ScrollPositionChanged { local, autoscroll });
         self.show_scrollbars(window, cx);
-        if let Some(workspace_id) = workspace_id {
-            let item_id = cx.entity().entity_id().as_u64() as ItemId;
-            let executor = cx.background_executor().clone();
+        // Intermediate smooth-scroll frames write the anchor directly without
+        // emitting scroll events or persisting to the DB; the final snap frame
+        // (where the target has already been cleared) goes through the full path.
+        if self.smooth_scroll_target.is_none() {
+            cx.emit(EditorEvent::ScrollPositionChanged { local, autoscroll });
+            if let Some(workspace_id) = workspace_id {
+                let item_id = cx.entity().entity_id().as_u64() as ItemId;
+                let executor = cx.background_executor().clone();
 
-            let db = EditorDb::global(cx);
-            self._save_scroll_position_task = cx.background_executor().spawn(async move {
-                executor.timer(Duration::from_millis(10)).await;
-                log::debug!(
-                    "Saving scroll position for item {item_id:?} in workspace {workspace_id:?}"
-                );
-                db.save_scroll_position(
-                    item_id,
-                    workspace_id,
-                    top_row,
-                    anchor.offset.x,
-                    anchor.offset.y,
-                )
-                .await
-                .log_err();
-            });
+                let db = EditorDb::global(cx);
+                self._save_scroll_position_task = cx.background_executor().spawn(async move {
+                    executor.timer(Duration::from_millis(10)).await;
+                    log::debug!(
+                        "Saving scroll position for item {item_id:?} in workspace {workspace_id:?}"
+                    );
+                    db.save_scroll_position(
+                        item_id,
+                        workspace_id,
+                        top_row,
+                        anchor.offset.x,
+                        anchor.offset.y,
+                    )
+                    .await
+                    .log_err();
+                });
+            }
         }
         cx.notify();
 
@@ -616,6 +627,15 @@ impl ScrollManager {
     pub fn forbid_vertical_scroll(&self) -> bool {
         self.forbid_vertical_scroll
     }
+
+    pub fn smooth_scroll_target(&self) -> Option<gpui::Point<ScrollOffset>> {
+        self.smooth_scroll_target
+    }
+
+    pub fn cancel_smooth_scroll(&mut self) {
+        self.smooth_scroll_target = None;
+        self.smooth_scroll_last_step = None;
+    }
 }
 
 impl Editor {
@@ -690,6 +710,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.scroll_manager.cancel_smooth_scroll();
         let mut delta = scroll_delta;
         if self.scroll_manager.forbid_vertical_scroll {
             delta.y = 0.0;
@@ -699,12 +720,98 @@ impl Editor {
         self.set_scroll_position_taking_display_map(position, true, false, display_map, window, cx);
     }
 
+    pub fn set_smooth_scroll_target(
+        &mut self,
+        target: gpui::Point<ScrollOffset>,
+        axis: Option<Axis>,
+        cx: &mut Context<Self>,
+    ) {
+        self.scroll_manager.update_ongoing_scroll(axis);
+        let target = if self.scroll_manager.forbid_vertical_scroll {
+            let current = self.scroll_position(cx);
+            point(target.x, current.y)
+        } else {
+            target
+        };
+        self.scroll_manager.smooth_scroll_target = Some(target);
+        if self.scroll_manager.smooth_scroll_last_step.is_none() {
+            self.scroll_manager.smooth_scroll_last_step = Some(Instant::now());
+        }
+        cx.notify();
+    }
+
+    /// The in-flight smooth-scroll target if one exists, otherwise the current
+    /// scroll position. Use this instead of `scroll_position` when computing
+    /// a new scroll destination so that repeated inputs accumulate correctly
+    /// while an animation is running.
+    pub fn scroll_target_or_position(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> gpui::Point<ScrollOffset> {
+        self.scroll_manager
+            .smooth_scroll_target
+            .unwrap_or_else(|| self.scroll_position(cx))
+    }
+
+    pub(crate) fn step_smooth_scroll(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> WasScrolled {
+        if self.scroll_manager.smooth_scroll_target.is_none() {
+            return WasScrolled(false);
+        };
+        let now = Instant::now();
+        let elapsed = self
+            .scroll_manager
+            .smooth_scroll_last_step
+            .map(|last| now.duration_since(last))
+            .unwrap_or_default();
+        self.scroll_manager.smooth_scroll_last_step = Some(now);
+        self.step_smooth_scroll_by(elapsed, window, cx)
+    }
+
+    pub(crate) fn step_smooth_scroll_by(
+        &mut self,
+        elapsed: Duration,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> WasScrolled {
+        let Some(target) = self.scroll_manager.smooth_scroll_target else {
+            return WasScrolled(false);
+        };
+
+        let current = self.scroll_position(cx);
+        let remaining = point(target.x - current.x, target.y - current.y);
+        if remaining.x.abs() < SMOOTH_SCROLL_SNAP_THRESHOLD
+            && remaining.y.abs() < SMOOTH_SCROLL_SNAP_THRESHOLD
+        {
+            self.scroll_manager.cancel_smooth_scroll();
+            return self.set_scroll_position_internal(target, true, false, window, cx);
+        }
+
+        let factor = 1.0 - (-elapsed.as_secs_f64() / SMOOTH_SCROLL_TIME_CONSTANT_SECS).exp();
+        let next = point(
+            current.x + remaining.x * factor,
+            current.y + remaining.y * factor,
+        );
+        let was_scrolled = self.set_scroll_position_internal(next, true, false, window, cx);
+        if !was_scrolled.0 && factor > 0.1 {
+            // Tried to advance a meaningful fraction of the remaining distance
+            // but the position didn't change (clamped at a boundary); stop
+            // requesting frames.
+            self.scroll_manager.cancel_smooth_scroll();
+        }
+        was_scrolled
+    }
+
     pub fn set_scroll_position(
         &mut self,
         scroll_position: gpui::Point<ScrollOffset>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> WasScrolled {
+        self.scroll_manager.cancel_smooth_scroll();
         let mut position = scroll_position;
         if self.scroll_manager.forbid_vertical_scroll {
             let current_position = self.scroll_position(cx);
@@ -720,6 +827,12 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Editor>,
     ) {
+        if EditorSettings::get_global(cx).smooth_scroll {
+            let current = self.scroll_target_or_position(cx);
+            self.set_smooth_scroll_target(point(current.x, row.as_f64()), None, cx);
+            return;
+        }
+
         let snapshot = self.snapshot(window, cx).display_snapshot;
         let new_screen_top = DisplayPoint::new(row, 0);
         let new_screen_top = new_screen_top.to_offset(&snapshot, Bias::Left);
@@ -801,6 +914,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.scroll_manager.cancel_smooth_scroll();
         hide_hover(self, cx);
         let workspace_id = self.workspace.as_ref().and_then(|workspace| workspace.1);
         let display_map = self.display_map.update(cx, |map, cx| map.snapshot(cx));
@@ -826,6 +940,7 @@ impl Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.scroll_manager.cancel_smooth_scroll();
         hide_hover(self, cx);
         let workspace_id = self.workspace.as_ref().and_then(|workspace| workspace.1);
         let buffer_snapshot = self.buffer().read(cx).snapshot(cx);
@@ -862,7 +977,12 @@ impl Editor {
             return;
         }
 
-        let mut current_position = self.scroll_position(cx);
+        let smooth_scroll = EditorSettings::get_global(cx).smooth_scroll;
+        let mut current_position = if smooth_scroll {
+            self.scroll_target_or_position(cx)
+        } else {
+            self.scroll_position(cx)
+        };
         let Some(visible_line_count) = self.visible_line_count() else {
             return;
         };
@@ -900,7 +1020,11 @@ impl Editor {
                 amount.columns(visible_column_count),
                 amount.lines(visible_line_count),
             );
-        self.set_scroll_position(new_position, window, cx);
+        if smooth_scroll {
+            self.set_smooth_scroll_target(new_position, None, cx);
+        } else {
+            self.set_scroll_position(new_position, window, cx);
+        }
     }
 
     /// Returns an ordering. The newest selection is:

@@ -264,6 +264,7 @@ impl VsCodeSettings {
             excerpt_context_lines: None,
             expand_excerpt_lines: None,
             fast_scroll_sensitivity: self.read_f32("editor.fastScrollSensitivity"),
+            smooth_scroll: self.read_bool("editor.smoothScrolling"),
             sticky_scroll: self.sticky_scroll_content(),
             go_to_definition_fallback: None,
             go_to_definition_scroll_strategy: None,

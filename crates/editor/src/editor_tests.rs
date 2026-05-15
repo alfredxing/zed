@@ -2883,6 +2883,105 @@ async fn test_scroll_page_up_page_down(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_smooth_scroll(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+    let mut cx = EditorTestContext::new(cx).await;
+    let content = (0..50).map(|i| format!("line {i}")).collect::<Vec<_>>();
+    cx.set_state(&format!("ˇ{}", content.join("\n")));
+
+    let scroll_events = Rc::new(RefCell::new(0usize));
+    cx.update_editor({
+        let scroll_events = scroll_events.clone();
+        move |_, _, cx| {
+            cx.subscribe(&cx.entity(), move |_, _, event: &EditorEvent, _| {
+                if matches!(event, EditorEvent::ScrollPositionChanged { .. }) {
+                    *scroll_events.borrow_mut() += 1;
+                }
+            })
+            .detach();
+        }
+    });
+
+    let frame = Duration::from_millis(16);
+
+    cx.update_editor(|editor, window, cx| {
+        assert_eq!(editor.scroll_position(cx), gpui::Point::new(0., 0.));
+        editor.set_smooth_scroll_target(gpui::Point::new(0., 10.), None, cx);
+        assert_eq!(
+            editor.scroll_target_or_position(cx),
+            gpui::Point::new(0., 10.)
+        );
+        assert_eq!(editor.scroll_position(cx), gpui::Point::new(0., 0.));
+
+        editor.step_smooth_scroll_by(frame, window, cx);
+        let after_one = editor.scroll_position(cx);
+        assert!(after_one.y > 0., "expected progress, got {after_one:?}");
+        assert!(after_one.y < 10., "overshot target, got {after_one:?}");
+
+        // Retarget mid-flight: new target, position continues from where it was.
+        editor.set_smooth_scroll_target(gpui::Point::new(0., 20.), None, cx);
+        assert_eq!(
+            editor.scroll_target_or_position(cx),
+            gpui::Point::new(0., 20.)
+        );
+        editor.step_smooth_scroll_by(frame, window, cx);
+        let after_two = editor.scroll_position(cx);
+        assert!(after_two.y > after_one.y, "{after_two:?} <= {after_one:?}");
+        assert!(after_two.y < 20.);
+
+        // Direction reversal.
+        editor.set_smooth_scroll_target(gpui::Point::new(0., 0.), None, cx);
+        editor.step_smooth_scroll_by(frame, window, cx);
+        let after_reverse = editor.scroll_position(cx);
+        assert!(
+            after_reverse.y < after_two.y,
+            "{after_reverse:?} >= {after_two:?}"
+        );
+    });
+
+    // No ScrollPositionChanged events emitted for intermediate frames.
+    assert_eq!(*scroll_events.borrow(), 0);
+
+    cx.update_editor(|editor, window, cx| {
+        // Drive to convergence.
+        editor.set_smooth_scroll_target(gpui::Point::new(0., 8.), None, cx);
+        let mut steps = 0;
+        while editor.scroll_manager.smooth_scroll_target().is_some() {
+            editor.step_smooth_scroll_by(frame, window, cx);
+            steps += 1;
+            assert!(steps < 100, "did not converge");
+        }
+        assert_eq!(editor.scroll_position(cx), gpui::Point::new(0., 8.));
+    });
+    // Exactly one event on the final snap.
+    assert_eq!(*scroll_events.borrow(), 1);
+
+    cx.update_editor(|editor, window, cx| {
+        // Direct scroll cancels an in-flight animation.
+        editor.set_smooth_scroll_target(gpui::Point::new(0., 30.), None, cx);
+        editor.step_smooth_scroll_by(frame, window, cx);
+        assert!(editor.scroll_manager.smooth_scroll_target().is_some());
+        editor.set_scroll_position(gpui::Point::new(0., 2.), window, cx);
+        assert!(editor.scroll_manager.smooth_scroll_target().is_none());
+        assert_eq!(editor.scroll_position(cx), gpui::Point::new(0., 2.));
+
+        // Autoscroll request cancels an in-flight animation.
+        editor.set_smooth_scroll_target(gpui::Point::new(0., 30.), None, cx);
+        assert!(editor.scroll_manager.smooth_scroll_target().is_some());
+        editor.request_autoscroll(Autoscroll::center(), cx);
+        assert!(editor.scroll_manager.smooth_scroll_target().is_none());
+
+        // Stuck guard: unreachable target (clamped at top) doesn't spin forever.
+        editor.set_scroll_position(gpui::Point::new(0., 0.), window, cx);
+        editor.scroll_manager.cancel_smooth_scroll();
+        editor.set_smooth_scroll_target(gpui::Point::new(0., -50.), None, cx);
+        editor.step_smooth_scroll_by(frame, window, cx);
+        assert!(editor.scroll_manager.smooth_scroll_target().is_none());
+        assert_eq!(editor.scroll_position(cx), gpui::Point::new(0., 0.));
+    });
+}
+
+#[gpui::test]
 async fn test_autoscroll(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
     let mut cx = EditorTestContext::new(cx).await;

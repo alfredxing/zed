@@ -3577,6 +3577,16 @@ Positive `float` values
 
 Positive `float` values
 
+### Smooth Scroll
+
+- Description: Whether to animate scrolling in the editor when using a mouse wheel. Precise trackpad input is unaffected.
+- Setting: `smooth_scroll`
+- Default: `false`
+
+**Options**
+
+`boolean` values
+
 ### Horizontal Scroll Margin
 
 - Description: The number of characters to keep on either side when scrolling with the mouse

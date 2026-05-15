@@ -108,6 +108,11 @@ pub struct EditorSettingsContent {
     /// Default: 4.0
     #[serde(serialize_with = "crate::serialize_optional_f32_with_two_decimal_places")]
     pub fast_scroll_sensitivity: Option<f32>,
+    /// Whether to animate scrolling in the editor when using a mouse wheel.
+    /// Precise trackpad input is unaffected.
+    ///
+    /// Default: false
+    pub smooth_scroll: Option<bool>,
     /// Settings for sticking scopes to the top of the editor.
     ///
     /// Default: sticky scroll is disabled

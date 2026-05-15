@@ -7759,6 +7759,8 @@ impl EditorElement {
                 .fast_scroll_sensitivity
                 .max(0.01);
 
+            let smooth_scroll = EditorSettings::get_global(cx).smooth_scroll;
+
             move |event: &ScrollWheelEvent, phase, window, cx| {
                 if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
                     delta = delta.coalesce(event.delta);
@@ -7791,28 +7793,37 @@ impl EditorElement {
                         editor.update(cx, |editor, cx| {
                             let line_height = position_map.line_height;
                             let glyph_width = position_map.em_layout_width;
-                            let (delta, axis) = match delta {
+                            let (delta, axis, animate) = match delta {
                                 gpui::ScrollDelta::Pixels(mut pixels) => {
                                     //Trackpad
                                     let axis =
                                         position_map.snapshot.ongoing_scroll.filter(&mut pixels);
-                                    (pixels, axis)
+                                    (pixels, axis, false)
                                 }
 
                                 gpui::ScrollDelta::Lines(lines) => {
                                     //Not trackpad
                                     let pixels =
                                         point(lines.x * glyph_width, lines.y * line_height);
-                                    (pixels, None)
+                                    (pixels, None, smooth_scroll)
                                 }
                             };
 
+                            // When animating, successive wheel events must accumulate
+                            // onto the in-flight target rather than the currently
+                            // rendered (interpolated) position, which is what the
+                            // snapshot holds.
                             let current_scroll_position = position_map.snapshot.scroll_position();
-                            let x = (current_scroll_position.x
+                            let base_scroll_position = editor
+                                .scroll_manager
+                                .smooth_scroll_target()
+                                .filter(|_| animate)
+                                .unwrap_or(current_scroll_position);
+                            let x = (base_scroll_position.x
                                 * ScrollPixelOffset::from(glyph_width)
                                 - ScrollPixelOffset::from(delta.x * scroll_sensitivity))
                                 / ScrollPixelOffset::from(glyph_width);
-                            let y = (current_scroll_position.y
+                            let y = (base_scroll_position.y
                                 * ScrollPixelOffset::from(line_height)
                                 - ScrollPixelOffset::from(delta.y * scroll_sensitivity))
                                 / ScrollPixelOffset::from(line_height);
@@ -7825,7 +7836,11 @@ impl EditorElement {
                             }
 
                             if scroll_position != current_scroll_position {
-                                editor.scroll(scroll_position, axis, window, cx);
+                                if animate {
+                                    editor.set_smooth_scroll_target(scroll_position, axis, cx);
+                                } else {
+                                    editor.scroll(scroll_position, axis, window, cx);
+                                }
                                 cx.stop_propagation();
                             } else if y < 0. {
                                 // Due to clamping, we may fail to detect cases of overscroll to the top;
@@ -10030,6 +10045,15 @@ impl Element for EditorElement {
                             autoscroll_containing_element,
                             needs_horizontal_autoscroll,
                         )
+                    });
+
+                    self.editor.update(cx, |editor, cx| {
+                        if editor.step_smooth_scroll(window, cx).0 {
+                            snapshot = editor.snapshot(window, cx);
+                        }
+                        if editor.scroll_manager.smooth_scroll_target().is_some() {
+                            window.request_animation_frame();
+                        }
                     });
 
                     let mut scroll_position = snapshot.scroll_position();

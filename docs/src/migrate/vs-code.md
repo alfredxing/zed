@@ -56,6 +56,7 @@ The following VS Code settings are automatically imported when you use **Import 
 | `editor.scrollbar.vertical`                 | `scrollbar.axes.vertical`                      |
 | `editor.mouseWheelScrollSensitivity`        | `scroll_sensitivity`                           |
 | `editor.fastScrollSensitivity`              | `fast_scroll_sensitivity`                      |
+| `editor.smoothScrolling`                    | `smooth_scroll`                                |
 | `editor.cursorSurroundingLines`             | `vertical_scroll_margin`                       |
 | `editor.hover.enabled`                      | `hover_popover_enabled`                        |
 | `editor.hover.delay`                        | `hover_popover_delay`                          |

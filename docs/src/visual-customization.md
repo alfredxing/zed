@@ -298,6 +298,8 @@ TBD: Centered layout related settings
   "scroll_sensitivity": 1.0,
   // Scroll sensitivity multiplier for fast scrolling (hold alt while scrolling)
   "fast_scroll_sensitivity": 4.0,
+  // Animate scrolling when using a mouse wheel (trackpad unaffected)
+  "smooth_scroll": false,
 ```
 
 ### Editor Tabs
